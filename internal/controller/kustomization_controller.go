@@ -852,9 +852,10 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 	sort.Sort(ssa.SortableUnstructureds(resStage))
 	if len(resStage) > 0 {
 		batches := splitIntoBatches(resStage, obj.GetAnnotations())
+		prevBatchHadChanges := false
 
 		for i, batch := range batches {
-			if i > 0 {
+			if i > 0 && prevBatchHadChanges {
 				delaySecs := getBatchDelaySecs(obj.GetAnnotations())
 				if delaySecs > 0 {
 					log.Info("batch apply throttling", "batch", i+1, "totalBatches", len(batches), "delaySecs", delaySecs)
@@ -866,6 +867,7 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 				}
 			}
 
+			prevBatchHadChanges = false
 			changeSet, err := manager.ApplyAll(ctx, batch, applyOpts)
 			if err != nil {
 				return false, nil, fmt.Errorf("%w\n%s", err, changeSetLog.String())
@@ -881,6 +883,7 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 				}
 				for _, change := range changeSet.Entries {
 					if HasChanged(change.Action) {
+						prevBatchHadChanges = true
 						changeSetLog.WriteString(change.String() + "\n")
 					}
 				}
