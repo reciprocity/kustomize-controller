@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -850,22 +851,38 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 	// sort by kind, validate and apply all the others objects
 	sort.Sort(ssa.SortableUnstructureds(resStage))
 	if len(resStage) > 0 {
-		changeSet, err := manager.ApplyAll(ctx, resStage, applyOpts)
-		if err != nil {
-			return false, nil, fmt.Errorf("%w\n%s", err, changeSetLog.String())
-		}
+		batches := splitIntoBatches(resStage, obj.GetAnnotations())
 
-		if changeSet != nil && len(changeSet.Entries) > 0 {
-			resultSet.Append(changeSet.Entries)
-
-			if r.GroupChangeLog {
-				log.Info("server-side apply for cluster definitions completed", "output", changeSet.ToGroupedMap())
-			} else {
-				log.Info("server-side apply completed", "output", changeSet.ToMap(), "revision", revision)
+		for i, batch := range batches {
+			if i > 0 {
+				delaySecs := getBatchDelaySecs(obj.GetAnnotations())
+				if delaySecs > 0 {
+					log.Info("batch apply throttling", "batch", i+1, "totalBatches", len(batches), "delaySecs", delaySecs)
+					select {
+					case <-ctx.Done():
+						return false, nil, ctx.Err()
+					case <-time.After(time.Duration(delaySecs) * time.Second):
+					}
+				}
 			}
-			for _, change := range changeSet.Entries {
-				if HasChanged(change.Action) {
-					changeSetLog.WriteString(change.String() + "\n")
+
+			changeSet, err := manager.ApplyAll(ctx, batch, applyOpts)
+			if err != nil {
+				return false, nil, fmt.Errorf("%w\n%s", err, changeSetLog.String())
+			}
+
+			if changeSet != nil && len(changeSet.Entries) > 0 {
+				resultSet.Append(changeSet.Entries)
+
+				if r.GroupChangeLog {
+					log.Info("server-side apply completed", "batch", i+1, "totalBatches", len(batches), "output", changeSet.ToGroupedMap())
+				} else {
+					log.Info("server-side apply completed", "batch", i+1, "totalBatches", len(batches), "output", changeSet.ToMap(), "revision", revision)
+				}
+				for _, change := range changeSet.Entries {
+					if HasChanged(change.Action) {
+						changeSetLog.WriteString(change.String() + "\n")
+					}
 				}
 			}
 		}
@@ -1173,4 +1190,42 @@ func (r *KustomizationReconciler) getPollerOptions(ctx context.Context,
 	}
 
 	return opts, nil
+}
+
+const (
+	applyStrategyAnnotation  = "reconcile.fluxcd.io/applyStrategy"
+	batchSizeAnnotation      = "reconcile.fluxcd.io/batchSize"
+	batchDelaySecsAnnotation = "reconcile.fluxcd.io/batchDelaySecs"
+)
+
+// splitIntoBatches splits objects into batches based on the Kustomization annotations.
+// If applyStrategy is not "batch" or batchSize is not set, all objects are returned as a single batch.
+func splitIntoBatches(objects []*unstructured.Unstructured, annotations map[string]string) [][]*unstructured.Unstructured {
+	if annotations[applyStrategyAnnotation] != "batch" {
+		return [][]*unstructured.Unstructured{objects}
+	}
+
+	batchSize, err := strconv.Atoi(annotations[batchSizeAnnotation])
+	if err != nil || batchSize <= 0 {
+		return [][]*unstructured.Unstructured{objects}
+	}
+
+	var batches [][]*unstructured.Unstructured
+	for i := 0; i < len(objects); i += batchSize {
+		end := i + batchSize
+		if end > len(objects) {
+			end = len(objects)
+		}
+		batches = append(batches, objects[i:end])
+	}
+	return batches
+}
+
+// getBatchDelaySecs returns the delay in seconds between batches from the Kustomization annotations.
+func getBatchDelaySecs(annotations map[string]string) int {
+	delaySecs, err := strconv.Atoi(annotations[batchDelaySecsAnnotation])
+	if err != nil || delaySecs < 0 {
+		return 0
+	}
+	return delaySecs
 }
