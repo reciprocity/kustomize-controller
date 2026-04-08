@@ -852,22 +852,32 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 	sort.Sort(ssa.SortableUnstructureds(resStage))
 	if len(resStage) > 0 {
 		batches := splitIntoBatches(resStage, obj.GetAnnotations())
-		prevBatchHadChanges := false
+		var prevBatchChangedSet *ssa.ChangeSet
 
 		for i, batch := range batches {
-			if i > 0 && prevBatchHadChanges {
-				delaySecs := getBatchDelaySecs(obj.GetAnnotations())
-				if delaySecs > 0 {
-					log.Info("batch apply throttling", "batch", i+1, "totalBatches", len(batches), "delaySecs", delaySecs)
-					select {
-					case <-ctx.Done():
-						return false, nil, ctx.Err()
-					case <-time.After(time.Duration(delaySecs) * time.Second):
-					}
+			if i > 0 && prevBatchChangedSet != nil && len(prevBatchChangedSet.Entries) > 0 {
+				batchTimeout := getBatchTimeout(obj.GetAnnotations())
+				log.Info("waiting for previous batch resources to reconcile",
+					"batch", i+1, "totalBatches", len(batches),
+					"batchTimeout", batchTimeout.String(),
+					"waitingOn", prevBatchChangedSet.ToMap())
+				if err := manager.WaitForSet(prevBatchChangedSet.ToObjMetadataSet(), ssa.WaitOptions{
+					Interval: 5 * time.Second,
+					Timeout:  batchTimeout,
+				}); err != nil {
+					log.Info("batch wait timed out, moving on to next batch",
+						"batch", i+1, "totalBatches", len(batches),
+						"error", err.Error())
+				} else {
+					log.Info("previous batch resources are ready, proceeding",
+						"batch", i+1, "totalBatches", len(batches))
 				}
+			} else if i > 0 {
+				log.Info("previous batch had no changes, skipping wait",
+					"batch", i+1, "totalBatches", len(batches))
 			}
 
-			prevBatchHadChanges = false
+			prevBatchChangedSet = ssa.NewChangeSet()
 			changeSet, err := manager.ApplyAll(ctx, batch, applyOpts)
 			if err != nil {
 				return false, nil, fmt.Errorf("%w\n%s", err, changeSetLog.String())
@@ -883,7 +893,7 @@ func (r *KustomizationReconciler) apply(ctx context.Context,
 				}
 				for _, change := range changeSet.Entries {
 					if HasChanged(change.Action) {
-						prevBatchHadChanges = true
+						prevBatchChangedSet.Append([]ssa.ChangeSetEntry{change})
 						changeSetLog.WriteString(change.String() + "\n")
 					}
 				}
@@ -1196,9 +1206,10 @@ func (r *KustomizationReconciler) getPollerOptions(ctx context.Context,
 }
 
 const (
-	applyStrategyAnnotation  = "reconcile.fluxcd.io/applyStrategy"
-	batchSizeAnnotation      = "reconcile.fluxcd.io/batchSize"
-	batchDelaySecsAnnotation = "reconcile.fluxcd.io/batchDelaySecs"
+	applyStrategyAnnotation      = "reconcile.fluxcd.io/applyStrategy"
+	batchSizeAnnotation          = "reconcile.fluxcd.io/batchSize"
+	batchTimeoutSecsAnnotation   = "reconcile.fluxcd.io/batchTimeoutSecs"
+	defaultBatchTimeoutSecs      = 60
 )
 
 // splitIntoBatches splits objects into batches based on the Kustomization annotations.
@@ -1224,11 +1235,15 @@ func splitIntoBatches(objects []*unstructured.Unstructured, annotations map[stri
 	return batches
 }
 
-// getBatchDelaySecs returns the delay in seconds between batches from the Kustomization annotations.
-func getBatchDelaySecs(annotations map[string]string) int {
-	delaySecs, err := strconv.Atoi(annotations[batchDelaySecsAnnotation])
-	if err != nil || delaySecs < 0 {
-		return 0
+// getBatchTimeout returns the timeout duration between batches from the Kustomization annotations.
+// Defaults to 60 seconds if not set or invalid.
+func getBatchTimeout(annotations map[string]string) time.Duration {
+	if v, ok := annotations[batchTimeoutSecsAnnotation]; ok {
+		secs, err := strconv.Atoi(v)
+		if err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
 	}
-	return delaySecs
+	return time.Duration(defaultBatchTimeoutSecs) * time.Second
 }
+
